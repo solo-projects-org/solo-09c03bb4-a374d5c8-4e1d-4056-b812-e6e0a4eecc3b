@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Flask 路由：上传、补测/清空、温差维护、块查询、下载。"""
+"""Flask 路由：上传、补测/清空、温差维护、块查询、下载、档案复原。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 from flask import (Flask, Response, abort, flash, redirect, render_template,
                    request, url_for)
 
-from . import csvutil, db
+from . import archive, csvutil, db
 from .csvutil import CSVParseError, TEMP_MAX, TEMP_MIN
 from .quadtree import is_power_of_two
 
@@ -247,6 +247,110 @@ def create_app(db_path: Optional[str] = None) -> Flask:
             return render_template("events.html", rows=rows, grid=grid)
         finally:
             c.close()
+
+    # --------------------------- 档案复原 ---------------------------
+    @app.route("/archive")
+    def archive_view():
+        c = conn()
+        try:
+            arch = archive.current_archive(c)
+            ev_count = archive.evidence_count(c, arch["id"]) if arch else 0
+            return render_template("archive.html",
+                                   archive=arch, ev_count=ev_count)
+        finally:
+            c.close()
+
+    @app.route("/archive/import", methods=["POST"])
+    def archive_import():
+        f = request.files.get("csvfile")
+        if f is None or f.filename == "":
+            flash("请选择要导入的供数 CSV 文件", "error")
+            return redirect(url_for("archive_view"))
+        try:
+            n, blocks = archive.parse_blocks_csv(f.read())
+        except CSVParseError as exc:
+            flash(f"供数 CSV 校验失败，旧档案保持不变：{exc}", "error")
+            return redirect(url_for("archive_view"))
+        c = conn()
+        try:
+            aid = archive.import_archive(c, n, blocks)
+        except Exception as exc:  # 建档失败回滚，旧档案与补证不受影响
+            app.logger.exception("archive import failed")
+            flash(f"建档失败，已回滚，旧档案与补证仍可下载：{exc}", "error")
+            return redirect(url_for("archive_view"))
+        finally:
+            c.close()
+        flash(f"档案 #{aid} 已生效：{n}×{n} 网格，{len(blocks)} 个供数块；"
+              "旧档案及其补证已整档替换", "ok")
+        return redirect(url_for("archive_view"))
+
+    @app.route("/archive/evidence", methods=["POST"])
+    def archive_evidence():
+        try:
+            token = int(request.form.get("archive_id", "").strip())
+        except ValueError:
+            flash("档案令牌缺失或非法，请刷新档案复原页后重试", "error")
+            return redirect(url_for("archive_view"))
+        f = request.files.get("csvfile")
+        if f is None or f.filename == "":
+            flash("请选择要上传的补证 CSV 文件", "error")
+            return redirect(url_for("archive_view"))
+        try:
+            rows = archive.parse_evidence_csv(f.read())
+        except CSVParseError as exc:
+            flash(f"补证 CSV 解析失败，整份退回，未写入任何数据：{exc}", "error")
+            return redirect(url_for("archive_view"))
+        c = conn()
+        try:
+            metrics = archive.apply_evidence(c, token, rows)
+        except archive.ArchiveStale as exc:
+            flash(f"补证未写入：{exc}", "error")
+            return redirect(url_for("archive_view"))
+        except archive.ArchiveReject as exc:
+            flash(f"补证整份退回，未写入任何数据：{exc}", "error")
+            return redirect(url_for("archive_view"))
+        except Exception as exc:  # 写库失败同样回滚，库中证据保持原样
+            app.logger.exception("evidence failed")
+            flash(f"补证写入失败，已回滚，库中证据保持原样：{exc}", "error")
+            return redirect(url_for("archive_view"))
+        finally:
+            c.close()
+        flash(f"补证收录 {metrics['inserted']} 格"
+              + (f"，同格同值幂等跳过 {metrics['duplicates']} 格"
+                 if metrics["duplicates"] else "")
+              + f"，复核触及块 {metrics['blocks_checked']} 个", "ok")
+        return redirect(url_for("archive_view"))
+
+    @app.route("/archive/download")
+    def archive_download():
+        c = conn()
+        try:
+            # 读事务：快照固定在下载开始时已入库的档案与读数；
+            # WAL 模式下下载期间其他请求仍可补证、换档，互不影响
+            c.execute("BEGIN")
+            arch = archive.current_archive(c)
+        except Exception:
+            c.close()
+            raise
+        if arch is None:
+            c.execute("ROLLBACK")
+            c.close()
+            abort(404, description="尚未导入供数档案，无法下载复原表")
+        aid, n = arch["id"], arch["grid_side"]
+
+        def generate():
+            try:
+                yield from archive.iter_restore_csv(c, aid, n)
+            finally:
+                c.execute("ROLLBACK")
+                c.close()
+
+        fname = f"furnace_restore_{n}x{n}_archive{aid}.csv"
+        return Response(
+            generate(),
+            mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={fname}"},
+        )
 
     @app.errorhandler(404)
     def not_found(err):

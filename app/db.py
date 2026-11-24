@@ -113,6 +113,43 @@ CREATE TABLE IF NOT EXISTS event_log (
     kind       TEXT NOT NULL,
     detail     TEXT NOT NULL
 );
+
+-- 档案复原：与现行格网完全独立的三张表（只被 app/archive.py 读写）。
+-- archive 全表至多一行：导入新档即整档替换；id 单调递增，
+-- 页面以下发的 id 作令牌，新档生效后旧页的补证无法写入新档。
+CREATE TABLE IF NOT EXISTS archive (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    grid_side   INTEGER NOT NULL,
+    block_count INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS archive_block (
+    archive_id INTEGER NOT NULL REFERENCES archive(id),
+    row_idx    INTEGER NOT NULL,
+    col_idx    INTEGER NOT NULL,
+    side       INTEGER NOT NULL,
+    temp_max   INTEGER NOT NULL,
+    temp_min   INTEGER NOT NULL,
+    cell_count INTEGER NOT NULL,
+    PRIMARY KEY (archive_id, row_idx, col_idx, side)
+) WITHOUT ROWID;
+
+-- 纸档补证：一格一行；blk_* 冗余记录所属块坐标（入库前已校验落块），
+-- 供分块统计与复原下载按块归并时免回查块表。
+CREATE TABLE IF NOT EXISTS evidence (
+    archive_id INTEGER NOT NULL REFERENCES archive(id),
+    row_idx    INTEGER NOT NULL,
+    col_idx    INTEGER NOT NULL,
+    temp       INTEGER NOT NULL,
+    blk_row    INTEGER NOT NULL,
+    blk_col    INTEGER NOT NULL,
+    blk_side   INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (archive_id, row_idx, col_idx)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_evidence_block
+    ON evidence(archive_id, blk_row, blk_col, blk_side);
 """
 
 
@@ -249,6 +286,16 @@ def _new_batch(conn: sqlite3.Connection, reason: str,
 def _log(conn: sqlite3.Connection, kind: str, detail: str) -> None:
     conn.execute("INSERT INTO event_log(ts,kind,detail) VALUES(?,?,?)",
                  (_now(), kind, detail))
+
+
+def log_event(conn: sqlite3.Connection, kind: str, detail: str) -> None:
+    """对外暴露的审计日志入口（档案复原等独立模块复用）。"""
+    _log(conn, kind, detail)
+
+
+def utc_now() -> str:
+    """对外暴露的 UTC 时间戳（与 _now 同格式）。"""
+    return _now()
 
 
 def _materialize_subtree(node_rows, coord, adds, leaf_need) -> None:

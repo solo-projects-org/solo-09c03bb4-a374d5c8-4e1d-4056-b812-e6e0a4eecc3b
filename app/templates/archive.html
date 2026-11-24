@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}档案复原 · 温度格网交接{% endblock %}
+{% block body %}
+
+<div class="card">
+  <h2>档案复原 · 当前供数档案</h2>
+  {% if archive %}
+  <span class="kv">档案号：<b>#{{ archive.id }}</b></span>
+  <span class="kv">网格边长：<b>{{ archive.grid_side }}</b></span>
+  <span class="kv">供数块：<b>{{ archive.block_count }}</b></span>
+  <span class="kv">已收录补证：<b>{{ ev_count }}</b> 格</span>
+  <span class="kv">建档时间 (UTC)：<b>{{ archive.created_at }}</b></span>
+  {% else %}
+  <p class="muted">
+    尚未导入供数档案。炉壁复验的电子档只剩供数块——请先在
+    <a href="{{ url_for('blocks_view') }}">现行覆盖块</a> 页下载供数 CSV，
+    再回到本页建档，然后用纸档补出原值。
+  </p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>① 导入供数 CSV 建档（整档替换）</h2>
+  <p class="muted">
+    只接受本工具下载的<b>非空</b>供数 CSV（表头
+    block_id,row_start,col_start,side,temp_max_c,temp_min_c,cell_count,grid_side）。
+    导入前校验：块四叉树对齐、互不重叠、温度区间合法、覆盖格数与边长相符。
+    网页只保留一份档案：新档生效后旧档及其补证一并失效，
+    <b>旧页面上的补证无法再写入新档</b>；校验或写入失败时旧档案原样保留。
+  </p>
+  <form action="{{ url_for('archive_import') }}" method="post" enctype="multipart/form-data" class="row-form">
+    <div class="field"><label>供数 CSV</label>
+      <input type="file" name="csvfile" accept=".csv,text/csv" required></div>
+    <button type="submit" class="danger">导入并替换当前档案</button>
+  </form>
+</div>
+
+{% if archive %}
+<div class="card">
+  <h2>② 上传纸档补证 CSV</h2>
+  <p class="muted">
+    每行三列：<b>行,列,温度</b>（行、列从 1 开始，整数摄氏度，首行可为表头）。
+    坐标须落在某供数块内，温度不得超出该块所报范围；同格同值重传自动幂等跳过；
+    若<b>同格异值</b>，或合并后某块<b>无法实际达到所报最高/最低温</b>，
+    则整份补证退回、分毫不写。
+  </p>
+  <form action="{{ url_for('archive_evidence') }}" method="post" enctype="multipart/form-data" class="row-form">
+    <input type="hidden" name="archive_id" value="{{ archive.id }}">
+    <div class="field"><label>补证 CSV</label>
+      <input type="file" name="csvfile" accept=".csv,text/csv" required></div>
+    <button type="submit">校验并收录补证</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>③ 下载复原 CSV</h2>
+  <p class="muted">
+    逐行输出全部 {{ archive.grid_side }}×{{ archive.grid_side }} 格的
+    <b>行,列,温度,状态</b>。流式生成，不在内存铺开整张方阵；
+    文件内容固定为<b>下载开始时</b>已入库的档案与读数，下载期间仍可继续补证；
+    换档或补证失败不影响本结果，重启后按已收证据重新下载亦一致。状态口径：
+  </p>
+  <ul class="muted">
+    <li><b>纸档原值</b>：补证直接给出的温度；</li>
+    <li><b>唯一能推回</b>：块所报区间退化为单值，或块内仅剩一格未补证、
+      所报最高/最低温只能由它承担；</li>
+    <li><b>已测但原值不明</b>：格在块内（当年测过）但原值无法唯一确定，温度留空；</li>
+    <li><b>未测</b>：格不在任何供数块内，温度留空。</li>
+  </ul>
+  <a href="{{ url_for('archive_download') }}"><button type="button">下载复原 CSV</button></a>
+</div>
+{% endif %}
+
+{% endblock %}
